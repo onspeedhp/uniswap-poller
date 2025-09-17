@@ -1,0 +1,35 @@
+{
+  "name": "uniswap-poller",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/eventMonitor.ts",
+    "build": "tsc",
+    "start": "node dist/eventMonitor.js",
+    "demo": "node demo.js",
+    "clean": "rm -rf dist data/*.csv",
+    "setup": "npm install && npm run build && npm run demo"
+  },
+  "keywords": [
+    "uniswap",
+    "v3",
+    "defi",
+    "liquidity",
+    "monitoring"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "Uniswap V3 pool monitoring with CSV logging for range analysis",
+  "dependencies": {
+    "viem": "^2.13.0",
+    "@uniswap/sdk-core": "^7.7.2",
+    "@uniswap/v3-sdk": "^3.18.0",
+    "dotenv": "^17.2.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.4",
+    "@types/node": "^20.0.0"
+  }
+}
