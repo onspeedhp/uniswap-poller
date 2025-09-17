@@ -7,11 +7,12 @@ import {
   type Address,
   type PublicClient,
   type Log,
+  type Chain,
 } from 'viem';
 import { config } from './config.js';
 import {
   LPFarmingLogger,
-  type BinChangeData,
+  type TickChangeData,
   type LPOpportunityData,
   type APRTrackingData,
   type DetailedPoolData,
@@ -19,107 +20,75 @@ import {
 import {
   price1Per0FromSqrt,
   price1Per0FromSqrtPrecise,
-  analyzeBinEdges,
-  calculateAPR,
-  calculateImpermanentLoss,
-  calculateMedian,
-  calculateOptimalLPRange,
-  isPriceInRange,
-  type BinEdgeAnalysis,
-  type APRCalculation,
+  analyzeTickRange,
+  calculateAPRFromHistory,
+  calculatePriceVolatility,
+  calculateTickRangeDurationStats,
+  formatDuration,
+  type TickRangeAnalysis,
 } from './mathUtils.js';
+import { UNISWAP_V3_POOL_ABI, SWAP_EVENT_ABI } from './constants.js';
+import { UniswapV3PoolFetcher, type PoolData } from './poolFetcher.js';
 
-// Network Configuration với automatic fallback
-const createChainConfig = (useKatana: boolean = true) => {
-  if (useKatana && process.env.FORCE_MAINNET !== 'true') {
-    // Katana Network (Ronin) Configuration
-    return {
-      id: 2020,
-      name: 'Katana',
-      nativeCurrency: { name: 'Ronin', symbol: 'RON', decimals: 18 },
-      rpcUrls: {
-        default: {
-          http: ['https://api.roninchain.com/rpc'],
-          webSocket: config.RPC_WS ? [config.RPC_WS] : undefined,
-        },
-      },
-    } as const;
-  } else {
-    // Ethereum Mainnet Fallback với multiple RPC endpoints
-    return {
-  id: 1,
-  name: 'Ethereum',
-  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+// ==================== KATANA NETWORK CONFIGURATION ====================
+
+const KATANA_CHAIN: Chain = {
+  id: config.CHAIN_ID,
+  name: config.CHAIN_NAME,
+  nativeCurrency: { name: 'Ethereum', symbol: 'ETH', decimals: 18 },
   rpcUrls: {
     default: {
-          http: [
-            'https://ethereum.publicnode.com', // Reliable, supports all methods
-            'https://ethereum-rpc.publicnode.com', // Good, supports all methods
-            'https://eth.drpc.org', // Fast, supports all methods
-            'https://rpc.flashbots.net', // Good, supports all methods
-            'https://eth.merkle.io', // Reliable, supports all methods
-            config.RPC_FALLBACK_HTTP || 'https://cloudflare-eth.com',
-          ],
+      http: [config.RPC_HTTP],
       webSocket: config.RPC_WS ? [config.RPC_WS] : undefined,
     },
   },
+  blockExplorers: {
+    default: {
+      name: 'Katana Explorer',
+      url: 'https://explorer.katana.network',
+    },
+  },
+  testnet: false,
 } as const;
-  }
-};
 
-// Default chain configuration
-let CHAIN_CONFIG = createChainConfig(true);
-
-// Essential ABIs
-const poolAbi = parseAbi([
-  'function token0() view returns (address)',
-  'function token1() view returns (address)',
-  'function fee() view returns (uint24)',
-  'function tickSpacing() view returns (int24)',
-  'function liquidity() view returns (uint128)',
-  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)',
-]);
-
-const erc20Abi = parseAbi([
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)',
-]);
-
-const swapEventAbi = parseAbi([
-  'event Swap(address sender,address recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)',
-]);
+// ==================== UNISWAP V3 ABIS ====================
+// Using shared ABIs from constants.ts
 
 // ==================== LP FARMING MONITOR CLASS ====================
 
-class LPFarmingMonitor {
-  private client: any; // Use any type to avoid strict typing issues with chain configs
+export class LPFarmingMonitor {
+  private client: PublicClient;
   private logger: LPFarmingLogger;
+  private poolFetcher: UniswapV3PoolFetcher;
   private poolAddress: Address;
 
   // Pool configuration
-  private token0Address?: Address;
-  private token1Address?: Address;
-  private fee?: number;
-  private tickSpacing?: number;
-  private token0Decimals?: number;
-  private token1Decimals?: number;
-  private token0Symbol?: string;
-  private token1Symbol?: string;
+  private token0Address: Address;
+  private token1Address: Address;
+  private fee: number;
+  private tickSpacing: number;
+  private token0Decimals: number;
+  private token1Decimals: number;
+  private token0Symbol: string;
+  private token1Symbol: string;
+  private poolData?: PoolData;
 
-  // Bin tracking state
-  private currentBin?: number;
-  private previousBin?: number;
-  private lastBinChangeTimestamp?: number;
+  // Tick tracking state
+  private currentTick?: number;
+  private previousTick?: number;
+  private lastTickChangeTimestamp?: number;
   private currentPrecisePrice?: string;
-  private currentEdgeAnalysis?: BinEdgeAnalysis;
-  private binHistory: Array<{ bin: number; timestamp: number; price: number }> =
-    [];
-  private binDurations: number[] = [];
+  private currentTickRangeAnalysis?: TickRangeAnalysis;
+  private tickHistory: Array<{
+    tick: number;
+    timestamp: number;
+    price: number;
+  }> = [];
+  private tickRangeDurations: number[] = [];
 
   // Market data tracking
   private priceHistory: Array<{ price: number; timestamp: number }> = [];
   private volumeHistory: Array<{ volume: number; timestamp: number }> = [];
-  private feesCollected: number = 0;
   private totalValueLocked: number = 0;
 
   // Performance tracking
@@ -129,31 +98,36 @@ class LPFarmingMonitor {
 
   // Dashboard state
   private dashboardInterval?: NodeJS.Timeout;
+  private analysisInterval?: NodeJS.Timeout;
+  private aprInterval?: NodeJS.Timeout;
 
   constructor() {
-    // Initialize with first chain config attempt
-    this.client = this.createClientWithConfig(CHAIN_CONFIG);
+    this.client = this.createClient();
     this.logger = new LPFarmingLogger();
     this.poolAddress = config.POOL;
+    this.poolFetcher = new UniswapV3PoolFetcher(this.client, this.poolAddress);
     this.monitorStartTime = Date.now();
+
+    // Initialize pool configuration
+    this.token0Address = config.TOKEN0_ADDRESS;
+    this.token1Address = config.TOKEN1_ADDRESS;
+    this.fee = config.FEE_TIER;
+    this.tickSpacing = config.TICK_SPACING;
+    this.token0Decimals = 6; // USDC decimals
+    this.token1Decimals = 18; // WETH decimals
+    this.token0Symbol = 'USDC';
+    this.token1Symbol = 'WETH';
   }
 
-  private createClientWithConfig(chainConfig: any): any {
-    const rpcUrls = Array.isArray(chainConfig.rpcUrls.default.http)
-      ? chainConfig.rpcUrls.default.http
-      : [chainConfig.rpcUrls.default.http];
-
-    // Use first RPC URL for now, we'll implement fallback in testConnection
-    const primaryRpc = rpcUrls[0];
-
+  private createClient(): PublicClient {
     return createPublicClient({
-      chain: chainConfig,
+      chain: KATANA_CHAIN,
       transport: config.RPC_WS
         ? webSocket(config.RPC_WS, {
             timeout: 15000,
             retryCount: 3,
           })
-        : http(primaryRpc, {
+        : http(config.RPC_HTTP, {
             timeout: 15000,
             retryCount: 3,
           }),
@@ -161,21 +135,21 @@ class LPFarmingMonitor {
   }
 
   private async testConnection(): Promise<boolean> {
-    const rpcUrls = Array.isArray(CHAIN_CONFIG.rpcUrls.default.http)
-      ? CHAIN_CONFIG.rpcUrls.default.http
-      : [CHAIN_CONFIG.rpcUrls.default.http];
+    const rpcUrls = Array.isArray(KATANA_CHAIN.rpcUrls.default.http)
+      ? KATANA_CHAIN.rpcUrls.default.http
+      : [KATANA_CHAIN.rpcUrls.default.http];
 
     for (let i = 0; i < rpcUrls.length; i++) {
       try {
         console.log(
-          `🔗 Testing connection to ${CHAIN_CONFIG.name} (${i + 1}/${
+          `🔗 Testing connection to ${KATANA_CHAIN.name} (${i + 1}/${
             rpcUrls.length
           })...`
         );
 
         // Create temporary client with this RPC
         const tempClient = createPublicClient({
-          chain: CHAIN_CONFIG,
+          chain: KATANA_CHAIN,
           transport: http(rpcUrls[i], {
             timeout: 10000,
             retryCount: 1,
@@ -195,7 +169,7 @@ class LPFarmingMonitor {
         );
         if (i === rpcUrls.length - 1) {
           console.log(
-            `❌ All ${rpcUrls.length} RPC endpoints failed for ${CHAIN_CONFIG.name}`
+            `❌ All ${rpcUrls.length} RPC endpoints failed for ${KATANA_CHAIN.name}`
           );
         }
       }
@@ -204,197 +178,56 @@ class LPFarmingMonitor {
   }
 
   async initialize(): Promise<void> {
-    console.log('🎯 Khởi tạo LP Farming Monitor...');
+    console.log('🎯 Initializing LP Farming Monitor for Katana Network...');
 
-    // Test connection và fallback nếu cần
-    let connectionSuccessful = await this.testConnection();
-
+    // Test connection
+    const connectionSuccessful = await this.testConnection();
     if (!connectionSuccessful) {
-      console.log(
-        '🔄 Katana connection failed, falling back to Ethereum mainnet...'
-      );
-
-      // Update chain config to mainnet
-      CHAIN_CONFIG = createChainConfig(false);
-      this.client = this.createClientWithConfig(CHAIN_CONFIG);
-
-      // Update pool address to mainnet USDC/WETH pool for testing
-      this.poolAddress =
-        '0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640' as `0x${string}`;
-      console.log(`📍 Using Mainnet Pool: ${this.poolAddress}`);
-
-      // Test mainnet connection
-      connectionSuccessful = await this.testConnection();
-
-      if (!connectionSuccessful) {
-        throw new Error('❌ Both Katana and Mainnet connections failed!');
-      }
-    } else {
-      console.log(`📍 Using ${CHAIN_CONFIG.name} Pool: ${this.poolAddress}`);
+      throw new Error('❌ Failed to connect to Katana RPC');
     }
 
     try {
-      await this.loadPoolConfiguration();
+      // Test pool contract access
+      await this.testPoolContract();
+
+      // Load complete pool data with all ticks
+      this.poolData = await this.poolFetcher.fetchPoolData();
+
       await this.initializeHistoricalData();
       this.logger.getLogSummary();
 
-      console.log('✅ LP Farming Monitor đã sẵn sàng!');
-      console.log(`🌐 Network: ${CHAIN_CONFIG.name}`);
+      console.log('✅ LP Farming Monitor initialized successfully!');
+      console.log(`🌐 Network: ${KATANA_CHAIN.name}`);
       console.log(`🎯 Target Pool: ${this.token0Symbol}/${this.token1Symbol}`);
-      console.log(`💰 Fee Tier: ${this.fee ? this.fee / 10000 : 'Unknown'}%`);
+      console.log(`💰 Fee Tier: ${this.fee / 10000}%`);
       console.log(`📏 Tick Spacing: ${this.tickSpacing}`);
+      console.log(`📍 Pool Address: ${this.poolAddress}`);
+      console.log(`📊 Total Ticks: ${this.poolData.allTicks.length}`);
     } catch (error) {
-      console.error('❌ Pool configuration failed on', CHAIN_CONFIG.name);
-
-      // If we're still on Katana and pool doesn't work, fallback to mainnet
-      if (CHAIN_CONFIG.name === 'Katana') {
-        console.log(
-          '🔄 Pool not compatible with Katana, falling back to Ethereum mainnet...'
-        );
-
-        // Update chain config to mainnet
-        CHAIN_CONFIG = createChainConfig(false);
-        this.client = this.createClientWithConfig(CHAIN_CONFIG);
-
-        // Update pool address to mainnet USDC/WETH pool
-        this.poolAddress =
-          '0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640' as `0x${string}`;
-        console.log(`📍 Using Mainnet USDC/WETH Pool: ${this.poolAddress}`);
-
-        // Test mainnet connection with retry
-        let mainnetConnection = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          console.log(`🔄 Mainnet connection attempt ${attempt}/3...`);
-          mainnetConnection = await this.testConnection();
-          if (mainnetConnection) break;
-          if (attempt < 3) {
-            console.log('⏳ Waiting 2 seconds before retry...');
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          }
-        }
-
-        if (!mainnetConnection) {
-          throw new Error('❌ All mainnet RPC endpoints failed!');
-        }
-
-        // Retry with mainnet pool
-        try {
-          await this.loadPoolConfiguration();
-          await this.initializeHistoricalData();
-          this.logger.getLogSummary();
-
-          console.log('✅ LP Farming Monitor ready on Ethereum Mainnet!');
-          console.log(`🌐 Network: ${CHAIN_CONFIG.name}`);
-          console.log(
-            `🎯 Target Pool: ${this.token0Symbol}/${this.token1Symbol}`
-          );
-          console.log(
-            `💰 Fee Tier: ${this.fee ? this.fee / 10000 : 'Unknown'}%`
-          );
-          console.log(`📏 Tick Spacing: ${this.tickSpacing}`);
-        } catch (mainnetError) {
-          console.error('❌ Mainnet initialization also failed:', mainnetError);
-          throw mainnetError;
-        }
-      } else {
-        throw error;
-      }
+      console.error('❌ Pool configuration failed:', error);
+      throw error;
     }
   }
 
-  private async loadPoolConfiguration(): Promise<void> {
-    console.log(`🔍 Loading pool configuration...`);
-
+  private async testPoolContract(): Promise<void> {
     try {
-      // Load basic pool info
-      const [token0, token1, slot0] = await Promise.all([
-        this.client.readContract({
-          address: this.poolAddress,
-          abi: poolAbi,
-          functionName: 'token0',
-        }) as Promise<Address>,
-        this.client.readContract({
-          address: this.poolAddress,
-          abi: poolAbi,
-          functionName: 'token1',
-        }) as Promise<Address>,
-        this.client.readContract({
-          address: this.poolAddress,
-          abi: poolAbi,
-          functionName: 'slot0',
-        }) as Promise<any>,
-      ]);
+      console.log('🔍 Testing pool contract access...');
 
-      // Load pool parameters with fallbacks
-      let fee = 500n; // 0.05% default for USDC/ETH
-      let tickSpacing = 10n; // Default spacing
+      // Test slot0 function
+      const slot0 = (await this.client.readContract({
+        address: this.poolAddress,
+        abi: parseAbi(UNISWAP_V3_POOL_ABI),
+        functionName: 'slot0',
+      })) as [bigint, number, number, number, number, number, boolean];
 
-      try {
-        fee = BigInt(
-          (await this.client.readContract({
-          address: this.poolAddress,
-          abi: poolAbi,
-          functionName: 'fee',
-          })) as number
-        );
-      } catch {
-        console.warn('⚠️ Using default fee: 0.05%');
-      }
-
-      try {
-        tickSpacing = BigInt(
-          (await this.client.readContract({
-          address: this.poolAddress,
-          abi: poolAbi,
-          functionName: 'tickSpacing',
-          })) as number
-        );
-      } catch {
-        console.warn('⚠️ Using default tick spacing: 10');
-      }
-
-      // Load token information
-      const [decimals0, decimals1, symbol0, symbol1] = await Promise.all([
-        this.client.readContract({
-          address: token0,
-          abi: erc20Abi,
-          functionName: 'decimals',
-        }) as Promise<number>,
-        this.client.readContract({
-          address: token1,
-          abi: erc20Abi,
-          functionName: 'decimals',
-        }) as Promise<number>,
-        this.client.readContract({
-          address: token0,
-          abi: erc20Abi,
-          functionName: 'symbol',
-        }) as Promise<string>,
-        this.client.readContract({
-          address: token1,
-          abi: erc20Abi,
-          functionName: 'symbol',
-        }) as Promise<string>,
-      ]);
-
-      // Store configuration
-      this.token0Address = token0;
-      this.token1Address = token1;
-      this.fee = Number(fee);
-      this.tickSpacing = Number(tickSpacing);
-      this.token0Decimals = decimals0;
-      this.token1Decimals = decimals1;
-      this.token0Symbol = symbol0;
-      this.token1Symbol = symbol1;
-
-      console.log(`✅ Pool loaded: ${symbol0}/${symbol1}`);
-      console.log(`   💰 Fee: ${Number(fee) / 10000}%`);
-      console.log(`   📏 Tick Spacing: ${Number(tickSpacing)}`);
-      console.log(`   🔗 Token0: ${token0} (${decimals0} decimals)`);
-      console.log(`   🔗 Token1: ${token1} (${decimals1} decimals)`);
+      console.log('✅ Pool contract accessible');
+      console.log(`   Current tick: ${slot0[1]}`);
+      console.log(`   Sqrt price: ${slot0[0].toString()}`);
     } catch (error) {
-      console.error('❌ Failed to load pool configuration:', error);
-      throw error;
+      console.error('❌ Pool contract test failed:', error);
+      throw new Error(
+        'Failed to access pool contract. Please check the pool address.'
+      );
     }
   }
 
@@ -402,35 +235,31 @@ class LPFarmingMonitor {
     console.log('📊 Initializing historical data...');
 
     try {
-      // Get current pool state
-      const slot0 = (await this.client.readContract({
-        address: this.poolAddress,
-        abi: poolAbi,
-        functionName: 'slot0',
-      })) as any;
-
-      const currentTick = Number(slot0[1]);
-      const sqrtPriceX96 = slot0[0] as bigint;
+      // Get current pool state using pool fetcher
+      const currentState = await this.poolFetcher.getCurrentPoolState();
       const currentPrice = price1Per0FromSqrt(
-        sqrtPriceX96,
-        this.token0Decimals!,
-        this.token1Decimals!
+        currentState.sqrtPriceX96,
+        this.token0Decimals,
+        this.token1Decimals
       );
 
-      // Calculate current bin
-      const currentBin = Math.floor(currentTick / this.tickSpacing!);
-
-      // Initialize tracking
-      this.currentBin = currentBin;
-      this.lastBinChangeTimestamp = Math.floor(Date.now() / 1000);
+      // Initialize tracking with current tick
+      this.currentTick = currentState.currentTick;
+      this.lastTickChangeTimestamp = Math.floor(Date.now() / 1000);
 
       // Add to history
       const timestamp = Date.now();
-      this.binHistory.push({ bin: currentBin, timestamp, price: currentPrice });
+      this.tickHistory.push({
+        tick: currentState.currentTick,
+        timestamp,
+        price: currentPrice,
+      });
       this.priceHistory.push({ price: currentPrice, timestamp });
 
       console.log(
-        `✅ Initialized at bin ${currentBin}, price ${currentPrice.toFixed(6)}`
+        `✅ Initialized at tick ${
+          currentState.currentTick
+        }, price ${currentPrice.toFixed(6)}`
       );
     } catch (error) {
       console.error('❌ Failed to initialize historical data:', error);
@@ -441,21 +270,26 @@ class LPFarmingMonitor {
   startMonitoring(): void {
     console.log('\n🎯 Starting Advanced LP Farming Monitor...');
     console.log('📊 Data collection includes:');
-    console.log('   🔄 Chi tiết bin changes (từ bin nào sang bin nào)');
-    console.log('   📏 Khoảng cách đến edge trái và phải của bin');
-    console.log('   💰 APR calculation và tracking');
+    console.log('   🔄 Detailed tick changes (from tick to tick)');
+    console.log('   📏 Distance to left and right tick boundaries');
+    console.log('   💰 APR calculation and tracking');
     console.log('   🎯 LP opportunity scoring (0-100)');
-    console.log('   📈 Impermanent loss monitoring');
-    console.log('   🚨 Real-time alerts cho farming opportunities');
+    console.log('   📈 Price volatility monitoring');
+    console.log('   🚨 Real-time alerts for farming opportunities');
 
     console.log('\n🎨 Risk Zones:');
-    console.log('   🚨 DANGER (≤10%): Tránh add LP - rất gần edge');
-    console.log('   ⚠️  WARNING (10-20%): Cần cẩn thận - khá gần edge');
-    console.log('   ✅ SAFE (20-35%): An toàn để add LP');
-    console.log('   🎯 OPTIMAL (>35%): Tuyệt vời cho LP farming!');
+    console.log(
+      '   🚨 DANGER (≤10%): Avoid adding LP - very close to tick boundary'
+    );
+    console.log(
+      '   ⚠️  WARNING (10-20%): Be careful - quite close to tick boundary'
+    );
+    console.log('   ✅ SAFE (20-30%): Safe to add LP');
+    console.log('   🎯 OPTIMAL (>30%): Excellent for LP farming!');
 
     this.startSwapEventListener();
     this.startPeriodicAnalysis();
+    this.startAPRTracking();
     this.startDashboard();
 
     console.log('\n🚀 LP Farming Monitor is now LIVE!');
@@ -464,28 +298,44 @@ class LPFarmingMonitor {
   private startSwapEventListener(): void {
     console.log('👂 Starting swap event listener...');
 
-    // Try to start event listener, but fallback to polling if it fails
     try {
-    this.client.watchEvent({
-      address: this.poolAddress,
-      event: swapEventAbi[0],
-        onLogs: async (logs: any[]) => {
-        for (const log of logs) {
+      // Use a more compatible event listener approach
+      this.client.watchEvent({
+        address: this.poolAddress,
+        event: parseAbi(SWAP_EVENT_ABI)[0] as any,
+        onLogs: async (logs: Log[]) => {
+          for (const log of logs) {
             try {
+              // Validate log structure before processing
+              if (!log || !log.blockHash || !log.transactionHash) {
+                console.log('⚠️ Invalid log structure, skipping...', {
+                  hasBlockHash: !!log?.blockHash,
+                  hasTransactionHash: !!log?.transactionHash,
+                  log: log,
+                });
+                continue;
+              }
+
               await this.processSwapEvent(log);
             } catch (error) {
               console.error('❌ Error processing swap event:', error);
+              console.error('   Log details:', {
+                blockHash: log?.blockHash,
+                transactionHash: log?.transactionHash,
+                args: (log as any)?.args,
+              });
             }
           }
         },
         onError: (error: any) => {
           console.error('❌ Swap event listener error:', error);
           console.log('🔄 Event listening failed, using polling-only mode...');
-          // Don't restart - just use polling
         },
       });
+
+      console.log('✅ Swap event listener started successfully');
     } catch (error) {
-            console.log(
+      console.log(
         '❌ Failed to start event listener, using polling-only mode...'
       );
     }
@@ -493,16 +343,61 @@ class LPFarmingMonitor {
 
   private async processSwapEvent(log: Log): Promise<void> {
     const args = (log as any).args;
-    if (!args) return;
+    if (!args) {
+      console.log('⚠️ Swap event has no args, skipping...');
+      return;
+    }
 
-    const tick = Number(args[6]);
-    const sqrtPriceX96 = args[4] as bigint;
-    const liquidity = args[5] as bigint;
+    // Handle both array and object args structures
+    let tick, sqrtPriceX96, liquidity, amount0, amount1;
 
-    // Calculate bin and price
-    const bin = Math.floor(tick / this.tickSpacing!);
+    if (Array.isArray(args)) {
+      // Array format: [sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick]
+      if (args.length < 7) {
+        console.log('⚠️ Swap event args array too short, skipping...', {
+          argsLength: args.length,
+          args: args,
+        });
+        return;
+      }
+      tick = Number(args[6]);
+      sqrtPriceX96 = args[4];
+      liquidity = args[5];
+      amount0 = args[2];
+      amount1 = args[3];
+    } else if (typeof args === 'object' && args !== null) {
+      // Object format: {sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick}
+      tick = Number(args.tick);
+      sqrtPriceX96 = args.sqrtPriceX96;
+      liquidity = args.liquidity;
+      amount0 = args.amount0;
+      amount1 = args.amount1;
+    } else {
+      console.log('⚠️ Swap event args structure unexpected, skipping...', {
+        argsType: typeof args,
+        args: args,
+      });
+      return;
+    }
+
+    // Validate that we have valid values
+    if (isNaN(tick) || !sqrtPriceX96 || !liquidity) {
+      console.log('⚠️ Invalid swap event data, skipping...', {
+        tick,
+        sqrtPriceX96: typeof sqrtPriceX96,
+        liquidity: typeof liquidity,
+        args: args,
+      });
+      return;
+    }
+
+    // Convert to proper types
+    const sqrtPriceX96BigInt = BigInt(sqrtPriceX96);
+    const liquidityBigInt = BigInt(liquidity);
+
+    // Calculate price
     const price = price1Per0FromSqrt(
-      sqrtPriceX96,
+      sqrtPriceX96BigInt,
       this.token0Decimals!,
       this.token1Decimals!
     );
@@ -512,16 +407,57 @@ class LPFarmingMonitor {
     const timestamp = Number(block.timestamp);
     const blockNumber = Number(block.number);
 
-    // Check for bin change
-    if (this.currentBin !== undefined && bin !== this.currentBin) {
-      console.log(`🔄 BIN CHANGE: ${this.currentBin} → ${bin} (Tick: ${tick})`);
-      await this.handleBinChange({
-        fromBin: this.currentBin,
-        toBin: bin,
+    // Calculate swap volume in USD
+    let swapVolume = 0;
+    if (amount0 && amount1) {
+      const amount0Num = Number(amount0);
+      const amount1Num = Number(amount1);
+
+      // Convert amounts to proper decimals
+      const amount0Adjusted = amount0Num / Math.pow(10, this.token0Decimals!);
+      const amount1Adjusted = amount1Num / Math.pow(10, this.token1Decimals!);
+
+      // Calculate volume in USD (using current price)
+      // For token0 (USDC), amount0 is already in USD
+      // For token1 (ETH), convert using current price
+      // Use absolute values since one will be positive and one negative
+      if (Math.abs(amount0Adjusted) > Math.abs(amount1Adjusted)) {
+        swapVolume = Math.abs(amount0Adjusted); // USDC amount (absolute value)
+      } else {
+        swapVolume = Math.abs(amount1Adjusted) * price; // ETH amount * ETH price (absolute value)
+      }
+    }
+
+    // Update volume history
+    if (swapVolume > 0) {
+      this.volumeHistory.push({
+        volume: swapVolume,
+        timestamp: Date.now(),
+      });
+
+      // Keep only last 24 hours of data (assuming 1 entry per minute)
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      this.volumeHistory = this.volumeHistory.filter(
+        (v) => v.timestamp > oneDayAgo
+      );
+    }
+
+    // Update total value locked (simplified calculation)
+    if (liquidityBigInt > 0) {
+      this.totalValueLocked =
+        Number(liquidityBigInt) / Math.pow(10, this.token0Decimals!);
+    }
+
+    // Check for tick change
+    if (this.currentTick !== undefined && tick !== this.currentTick) {
+      console.log(`🔄 TICK CHANGE: ${this.currentTick} → ${tick}`);
+      await this.handleTickChange({
+        fromTick: this.currentTick,
+        toTick: tick,
         tick,
         price,
-        sqrtPriceX96,
-        liquidity: liquidity.toString(),
+        sqrtPriceX96: sqrtPriceX96BigInt,
+        liquidity: liquidityBigInt.toString(),
         blockNumber,
         blockTimestamp: timestamp,
         transactionHash: log.transactionHash || undefined,
@@ -529,19 +465,19 @@ class LPFarmingMonitor {
     }
 
     // Update current state
-    this.currentBin = bin;
-    this.previousBin = this.currentBin;
+    this.currentTick = tick;
+    this.previousTick = this.currentTick;
 
     // Update price history
     this.priceHistory.push({ price, timestamp: Date.now() });
     if (this.priceHistory.length > 1000) {
-      this.priceHistory = this.priceHistory.slice(-500); // Keep last 500 records
+      this.priceHistory = this.priceHistory.slice(-500);
     }
   }
 
-  private async handleBinChange(data: {
-    fromBin: number;
-    toBin: number;
+  private async handleTickChange(data: {
+    fromTick: number;
+    toTick: number;
     tick: number;
     price: number;
     sqrtPriceX96: bigint;
@@ -553,18 +489,17 @@ class LPFarmingMonitor {
     const now = Date.now();
     const currentTimestamp = Math.floor(now / 1000);
 
-    // Calculate bin change metrics
-    const binDirection = data.toBin > data.fromBin ? 'up' : 'down';
-    const ticksChanged =
-      Math.abs(data.toBin - data.fromBin) * this.tickSpacing!;
+    // Calculate tick change metrics
+    const tickDirection = data.toTick > data.fromTick ? 'up' : 'down';
+    const ticksChanged = Math.abs(data.toTick - data.fromTick);
 
     // Calculate timing metrics
-    let timeSinceLastBinChange = 0;
-    let binDuration = 0;
+    let timeSinceLastTickChange = 0;
+    let tickRangeDuration = 0;
 
-    if (this.lastBinChangeTimestamp) {
-      timeSinceLastBinChange = currentTimestamp - this.lastBinChangeTimestamp;
-      binDuration = timeSinceLastBinChange;
+    if (this.lastTickChangeTimestamp) {
+      timeSinceLastTickChange = currentTimestamp - this.lastTickChangeTimestamp;
+      tickRangeDuration = timeSinceLastTickChange;
     }
 
     // Calculate price change
@@ -574,8 +509,17 @@ class LPFarmingMonitor {
         : data.price;
     const priceChangePercentage = ((data.price - lastPrice) / lastPrice) * 100;
 
-    // Create bin change data
-    const binChangeData: BinChangeData = {
+    // Analyze tick range for additional metrics
+    const tickRangeAnalysis = analyzeTickRange(
+      data.tick,
+      this.tickSpacing!,
+      data.price,
+      this.token0Decimals!,
+      this.token1Decimals!
+    );
+
+    // Create tick change data
+    const tickChangeData: TickChangeData = {
       timestamp: new Date().toISOString(),
       blockNumber: data.blockNumber,
       transactionHash: data.transactionHash,
@@ -583,95 +527,72 @@ class LPFarmingMonitor {
       sqrtPriceX96: data.sqrtPriceX96.toString(),
       price: data.price,
       liquidity: data.liquidity,
-      fromBin: data.fromBin,
-      toBin: data.toBin,
-      binChangeDirection: binDirection,
+      fromTick: data.fromTick,
+      toTick: data.toTick,
+      tickChangeDirection: tickDirection,
       ticksChanged,
       priceChangePercentage,
-      timeSinceLastBinChange,
-      binDuration,
+      timeSinceLastTickChange,
+      tickRangeDuration,
       blockTimestamp: data.blockTimestamp,
+      tickRange: tickRangeAnalysis.tickRange,
+      currentPriceInRange: tickRangeAnalysis.currentPriceInRange,
     };
 
-    // Log bin change
-    this.logger.logBinChange(binChangeData);
+    // Log tick change
+    this.logger.logTickChange(tickChangeData);
 
-    // Update bin durations for statistics
-    if (binDuration > 0) {
-      this.binDurations.push(binDuration);
-      if (this.binDurations.length > 100) {
-        this.binDurations = this.binDurations.slice(-50);
+    // Update tick range durations for statistics
+    if (tickRangeDuration > 0) {
+      this.tickRangeDurations.push(tickRangeDuration);
+      if (this.tickRangeDurations.length > 100) {
+        this.tickRangeDurations = this.tickRangeDurations.slice(-50);
       }
     }
 
     // Update tracking
-    this.lastBinChangeTimestamp = currentTimestamp;
-    this.binHistory.push({
-      bin: data.toBin,
+    this.lastTickChangeTimestamp = currentTimestamp;
+    this.tickHistory.push({
+      tick: data.toTick,
       timestamp: now,
       price: data.price,
     });
 
-    // Immediately analyze LP opportunity after bin change
+    // Immediately analyze LP opportunity after tick change
     await this.analyzeLPOpportunity(data.tick, data.price, data.liquidity);
   }
 
   private startPeriodicAnalysis(): void {
     console.log('⏰ Starting periodic analysis...');
 
-    // Main analysis loop
-    setInterval(async () => {
+    this.analysisInterval = setInterval(async () => {
       try {
         await this.performPeriodicAnalysis();
       } catch (error) {
         console.error('❌ Periodic analysis error:', error);
       }
-    }, 10000); // 10 seconds - less frequent logging
-
-    // APR tracking (every 2 minutes for testing)
-    setInterval(async () => {
-      try {
-        await this.updateAPRTracking();
-    } catch (error) {
-        console.error('❌ APR tracking error:', error);
-      }
-    }, 2 * 60 * 1000);
-    }
+    }, config.POLL_INTERVAL_MS);
+  }
 
   private async performPeriodicAnalysis(): Promise<void> {
-    // Get current pool state
-    const slot0 = (await this.client.readContract({
-      address: this.poolAddress,
-      abi: poolAbi,
-      functionName: 'slot0',
-    })) as any;
+    // Get current pool state using pool fetcher
+    const currentState = await this.poolFetcher.getCurrentPoolState();
+    const tick = currentState.currentTick;
+    const sqrtPriceX96 = currentState.sqrtPriceX96;
+    const liquidity = currentState.liquidity.toString();
 
-    let liquidity = '0';
-    try {
-      const liquidityResult = (await this.client.readContract({
-        address: this.poolAddress,
-        abi: poolAbi,
-        functionName: 'liquidity',
-      })) as bigint;
-      liquidity = liquidityResult.toString();
-    } catch {
-      // Use fallback liquidity
-    }
-
-    const tick = Number(slot0[1]);
-    const sqrtPriceX96 = slot0[0] as bigint;
     const price = price1Per0FromSqrt(
       sqrtPriceX96,
-      this.token0Decimals!,
-      this.token1Decimals!
+      this.token0Decimals,
+      this.token1Decimals
     );
 
     // Get high precision price
     const precisePrice = price1Per0FromSqrtPrecise(
       sqrtPriceX96,
-      this.token0Decimals!,
-      this.token1Decimals!,
-      18 // 18 decimal precision
+      this.token0Decimals,
+      this.token1Decimals,
+      18
     );
 
     const blockNumber = await this.client.getBlockNumber();
@@ -679,36 +600,40 @@ class LPFarmingMonitor {
     // Store precise price for dashboard display
     this.currentPrecisePrice = precisePrice;
 
-    // Check for bin change in periodic analysis
-    const bin = Math.floor(tick / this.tickSpacing!);
-    if (this.currentBin !== undefined && bin !== this.currentBin) {
-      console.log(`🔄 BIN CHANGE: ${this.currentBin} → ${bin} (Tick: ${tick})`);
-      await this.handleBinChange({
-        fromBin: this.currentBin,
-        toBin: bin,
-        tick,
-        price,
-        sqrtPriceX96,
-        liquidity,
-        blockNumber: Number(blockNumber),
-        blockTimestamp: Math.floor(Date.now() / 1000),
-        transactionHash: undefined, // No transaction hash for periodic analysis
-      });
+    // Check for tick change in periodic analysis
+    if (this.currentTick !== undefined && tick !== this.currentTick) {
+      console.log(`🔄 TICK CHANGE DETECTED: ${this.currentTick} → ${tick}`);
+      try {
+        await this.handleTickChange({
+          fromTick: this.currentTick,
+          toTick: tick,
+          tick,
+          price,
+          sqrtPriceX96,
+          liquidity,
+          blockNumber: Number(blockNumber),
+          blockTimestamp: Math.floor(Date.now() / 1000),
+          transactionHash: undefined,
+        });
+        console.log(`✅ Tick change logged successfully`);
+      } catch (error) {
+        console.error(`❌ Error logging tick change:`, error);
+      }
     }
 
-    // Update current bin
-    this.currentBin = bin;
+    // Update current tick
+    this.currentTick = tick;
 
-    // Analyze LP opportunity and store edge analysis
-    const edgeAnalysis = await this.analyzeLPOpportunity(
+    // Analyze LP opportunity and store tick range analysis
+    const tickRangeAnalysis = await this.analyzeLPOpportunity(
       tick,
       price,
       liquidity,
       Number(blockNumber)
     );
-    
-    // Store edge analysis for dashboard display
-    this.currentEdgeAnalysis = edgeAnalysis;
+
+    // Store tick range analysis for dashboard display
+    this.currentTickRangeAnalysis = tickRangeAnalysis;
   }
 
   private async analyzeLPOpportunity(
@@ -716,14 +641,14 @@ class LPFarmingMonitor {
     price: number,
     liquidity: string,
     blockNumber?: number
-  ): Promise<BinEdgeAnalysis> {
-    // Perform bin edge analysis
-    const binAnalysis = analyzeBinEdges(
+  ): Promise<TickRangeAnalysis> {
+    // Perform tick range analysis
+    const tickRangeAnalysis = analyzeTickRange(
       tick,
-      this.tickSpacing!,
+      this.tickSpacing,
       price,
-      this.token0Decimals!,
-      this.token1Decimals!
+      this.token0Decimals,
+      this.token1Decimals
     );
 
     // Calculate opportunity score
@@ -733,12 +658,21 @@ class LPFarmingMonitor {
         : 0;
     const volatility = this.calculatePriceVolatility();
 
+    // Get current tick range duration
+    const currentTickRangeDuration = this.lastTickChangeTimestamp
+      ? Math.floor(Date.now() / 1000) - this.lastTickChangeTimestamp
+      : 0;
+
     const opportunityScore = LPFarmingLogger.calculateOpportunityScore(
-      binAnalysis.nearestEdgeDistancePct,
+      tickRangeAnalysis.nearestTickDistancePct,
       undefined, // APR data will be added later
       volume24h,
-      volatility
+      volatility,
+      currentTickRangeDuration
     );
+
+    // Calculate fees from volume
+    const opportunityFees24h = volume24h * (this.fee / 10000); // Convert fee from basis points to decimal
 
     // Create LP opportunity data
     const opportunityData: LPOpportunityData = {
@@ -746,109 +680,134 @@ class LPFarmingMonitor {
       blockNumber: blockNumber || 0,
       currentTick: tick,
       currentPrice: price,
-      currentBin: binAnalysis.currentBin,
-      distanceToLowerEdgePct: binAnalysis.distanceToLowerEdgePct,
-      distanceToUpperEdgePct: binAnalysis.distanceToUpperEdgePct,
-      nearestEdgeSide: binAnalysis.nearestEdgeSide,
-      nearestEdgeDistancePct: binAnalysis.nearestEdgeDistancePct,
-      riskLevel: binAnalysis.riskLevel,
-      riskDescription: binAnalysis.riskDescription,
-      lpRecommendation: binAnalysis.lpRecommendation,
-      binLowerPrice: binAnalysis.priceAtBinLower,
-      binUpperPrice: binAnalysis.priceAtBinUpper,
+      currentTickRange: tickRangeAnalysis.currentTick,
+      distanceToLowerTickPct: tickRangeAnalysis.distanceToLowerTickPct,
+      distanceToUpperTickPct: tickRangeAnalysis.distanceToUpperTickPct,
+      nearestTickSide: tickRangeAnalysis.nearestTickSide,
+      nearestTickDistancePct: tickRangeAnalysis.nearestTickDistancePct,
+      riskLevel: tickRangeAnalysis.riskLevel,
+      riskDescription: tickRangeAnalysis.riskDescription,
+      lpRecommendation: tickRangeAnalysis.lpRecommendation,
+      tickLowerPrice: tickRangeAnalysis.priceAtTickLower,
+      tickUpperPrice: tickRangeAnalysis.priceAtTickUpper,
+      tickRange: tickRangeAnalysis.tickRange,
+      currentPriceInRange: tickRangeAnalysis.currentPriceInRange,
       liquidity,
       volume24h,
+      fees24h: opportunityFees24h,
+      totalValueLocked: this.totalValueLocked || 0,
       opportunityScore,
+      priceVolatility: volatility,
+      tickRangeDuration: currentTickRangeDuration,
     };
 
     // Log significant LP opportunities only when risk level changes
     if (
-      binAnalysis.riskLevel === 'optimal' ||
-      binAnalysis.riskLevel === 'danger' ||
-      binAnalysis.riskLevel === 'warning'
+      tickRangeAnalysis.riskLevel === 'optimal' ||
+      tickRangeAnalysis.riskLevel === 'danger' ||
+      tickRangeAnalysis.riskLevel === 'warning'
     ) {
       this.logger.logLPOpportunity(opportunityData);
     }
 
     // Track consecutive safe opportunities
     if (
-      binAnalysis.lpRecommendation === 'add' ||
-      binAnalysis.lpRecommendation === 'excellent'
+      tickRangeAnalysis.lpRecommendation === 'add' ||
+      tickRangeAnalysis.lpRecommendation === 'excellent'
     ) {
       this.consecutiveSafeOpportunities++;
     } else {
       this.consecutiveSafeOpportunities = 0;
     }
 
+    // Calculate fees from volume
+    const detailedFees24h = volume24h * (this.fee / 10000); // Convert fee from basis points to decimal
+
     // Log detailed data
     const detailedData: DetailedPoolData = {
       timestamp: new Date().toISOString(),
       blockNumber: blockNumber || 0,
       tick,
-      sqrtPriceX96: BigInt(0).toString(), // Will be populated with actual value
+      sqrtPriceX96: BigInt(0).toString(),
       price,
       liquidity,
-      token0Symbol: this.token0Symbol!,
-      token1Symbol: this.token1Symbol!,
-      token0Address: this.token0Address!,
-      token1Address: this.token1Address!,
-      binAnalysis,
+      token0Symbol: this.token0Symbol,
+      token1Symbol: this.token1Symbol,
+      token0Address: this.token0Address,
+      token1Address: this.token1Address,
+      tickRangeAnalysis,
       eventType: 'periodic_analysis',
       severity:
-        binAnalysis.riskLevel === 'danger'
+        tickRangeAnalysis.riskLevel === 'danger'
           ? 'critical'
-          : binAnalysis.riskLevel === 'warning'
+          : tickRangeAnalysis.riskLevel === 'warning'
           ? 'warning'
           : 'info',
+      volume24h,
+      fees24h: detailedFees24h,
+      totalValueLocked: this.totalValueLocked,
+      priceVolatility: volatility,
     };
 
     this.logger.logDetailedData(detailedData);
-    
-    // Return the bin analysis for dashboard display
-    return binAnalysis;
+
+    // Return the tick range analysis for dashboard display
+    return tickRangeAnalysis;
+  }
+
+  private startAPRTracking(): void {
+    console.log('💰 Starting APR tracking...');
+
+    this.aprInterval = setInterval(async () => {
+      try {
+        await this.updateAPRTracking();
+      } catch (error) {
+        console.error('❌ APR tracking error:', error);
+      }
+    }, config.APR_CALCULATION_INTERVAL_MS);
   }
 
   private async updateAPRTracking(): Promise<void> {
     const now = Date.now();
 
     // Skip if updated recently
-    if (now - this.lastAPRUpdate < 1 * 60 * 1000) {
-      // 1 minute minimum interval
+    if (now - this.lastAPRUpdate < config.APR_CALCULATION_INTERVAL_MS) {
       return;
     }
 
     try {
-      // Calculate mock APR based on fees and activity
-      // In real implementation, you'd fetch actual volume and fees data
-      const mockVolume24h = 50000; // $50K daily volume estimate
-      const mockFees24h = mockVolume24h * (this.fee! / 10000); // Fee percentage
-      const mockTVL = 1000000; // $1M TVL estimate
+      // Calculate real APR based on historical data
+      const historicalData = this.volumeHistory.map((v, i) => ({
+        volume: v.volume,
+        fees: v.volume * (this.fee / 10000), // Calculate fees from volume
+        tvl: this.totalValueLocked || 1000000, // Use actual TVL or estimate
+        timestamp: v.timestamp,
+      }));
 
-      const aprCalculation = calculateAPR(
-        mockVolume24h,
-        mockFees24h,
-        mockTVL,
-        this.fee! / 10000
+      const aprCalculation = calculateAPRFromHistory(
+        historicalData,
+        this.fee / 10000
       );
 
       const aprData: APRTrackingData = {
         timestamp: new Date().toISOString(),
-        date: new Date().toISOString().split('T')[0], // YYYY-MM-DD
+        date: new Date().toISOString().split('T')[0],
         currentAPR: aprCalculation.currentAPR,
         projectedAPR: aprCalculation.projectedAPR,
         feeAPR: aprCalculation.feeAPR,
-        volume24h: mockVolume24h,
-        fees24h: mockFees24h,
-        totalValueLocked: mockTVL,
+        volume24h: aprCalculation.averageVolume24h,
+        fees24h: aprCalculation.averageFees24h,
+        totalValueLocked: aprCalculation.totalValueLocked,
         volumeToTVLRatio: aprCalculation.volumeToTVLRatio,
         aprConfidence: aprCalculation.aprConfidence,
         priceVolatility: this.calculatePriceVolatility(),
+        dailyFeeRate: aprCalculation.dailyFeeRate,
+        annualFeeRate: aprCalculation.annualFeeRate,
         notes: `Consecutive safe opportunities: ${this.consecutiveSafeOpportunities}`,
       };
 
       this.logger.logAPRTracking(aprData);
       this.lastAPRUpdate = now;
-      console.log(`📈 APR Updated: ${aprCalculation.currentAPR.toFixed(2)}% | Volume: $${mockVolume24h.toLocaleString()}`);
     } catch (error) {
       console.error('❌ Failed to update APR tracking:', error);
     }
@@ -858,14 +817,7 @@ class LPFarmingMonitor {
     if (this.priceHistory.length < 10) return 0;
 
     const recentPrices = this.priceHistory.slice(-20).map((p) => p.price);
-    const mean =
-      recentPrices.reduce((sum, price) => sum + price, 0) / recentPrices.length;
-    const variance =
-      recentPrices.reduce((sum, price) => sum + Math.pow(price - mean, 2), 0) /
-      recentPrices.length;
-    const volatility = Math.sqrt(variance) / mean; // Coefficient of variation
-
-    return volatility;
+    return calculatePriceVolatility(recentPrices);
   }
 
   // ==================== REAL-TIME DASHBOARD ====================
@@ -875,7 +827,7 @@ class LPFarmingMonitor {
 
     this.dashboardInterval = setInterval(() => {
       this.displayDashboard();
-    }, 30000); // Update dashboard every 30 seconds (less frequent)
+    }, config.DASHBOARD_UPDATE_INTERVAL_MS);
   }
 
   private displayDashboard(): void {
@@ -884,33 +836,85 @@ class LPFarmingMonitor {
     const minutes = Math.floor((uptime % 3600) / 60);
 
     console.clear();
-    console.log('╔══════════════════════════════════════════════════════════════╗');
-    console.log('║                   🎯 LP FARMING DASHBOARD 🎯                    ║');
-    console.log('╠══════════════════════════════════════════════════════════════╣');
-    console.log(`║ Pool: ${this.token0Symbol}/${this.token1Symbol} | Network: ${CHAIN_CONFIG.name} | Uptime: ${hours}h ${minutes}m ║`);
-    console.log('╠══════════════════════════════════════════════════════════════╣');
+    console.log(
+      '╔══════════════════════════════════════════════════════════════╗'
+    );
+    console.log(
+      '║                   🎯 LP FARMING DASHBOARD 🎯                    ║'
+    );
+    console.log(
+      '╠══════════════════════════════════════════════════════════════╣'
+    );
+    console.log(
+      `║ Pool: ${this.token0Symbol}/${this.token1Symbol} | Network: ${KATANA_CHAIN.name} | Uptime: ${hours}h ${minutes}m ║`
+    );
+    console.log(
+      '╠══════════════════════════════════════════════════════════════╣'
+    );
 
-    if (this.currentBin !== undefined && this.currentPrecisePrice) {
-      console.log(`║ 📍 Current Bin: ${this.currentBin} | Price: ${this.currentPrecisePrice} ║`);
-      
-        // Display edge distances if available
-        if (this.currentEdgeAnalysis) {
-          const lowerDistance = (this.currentEdgeAnalysis.distanceToLowerEdgePct * 100).toFixed(6);
-          const upperDistance = (this.currentEdgeAnalysis.distanceToUpperEdgePct * 100).toFixed(6);
-          const riskLevel = this.currentEdgeAnalysis.riskLevel.toUpperCase();
-          console.log(`║ 📏 Edge Distances: Lower ${lowerDistance}% | Upper ${upperDistance}% ║`);
-          console.log(`║ 🎯 Risk Level: ${riskLevel} | Recommendation: ${this.currentEdgeAnalysis.lpRecommendation} ║`);
-        }
+    if (this.currentTick !== undefined && this.currentPrecisePrice) {
+      console.log(
+        `║ 📍 Current Tick: ${this.currentTick} | Price: ${this.currentPrecisePrice} ║`
+      );
 
-      console.log(`║ 📊 Bin Changes: ${this.binHistory.length} | Safe Opportunities: ${this.consecutiveSafeOpportunities} ║`);
+      // Display tick boundary distances if available
+      if (this.currentTickRangeAnalysis) {
+        const lowerDistance = (
+          this.currentTickRangeAnalysis.distanceToLowerTickPct * 100
+        ).toFixed(1);
+        const upperDistance = (
+          this.currentTickRangeAnalysis.distanceToUpperTickPct * 100
+        ).toFixed(1);
+        const riskLevel = this.currentTickRangeAnalysis.riskLevel.toUpperCase();
+        const position = (
+          this.currentTickRangeAnalysis.currentPriceInRange * 100
+        ).toFixed(1);
+
+        console.log(
+          `║ 📏 Tick Boundary Distances: Lower ${lowerDistance}% | Upper ${upperDistance}% ║`
+        );
+        console.log(
+          `║ 🎯 Risk Level: ${riskLevel} | Position: ${position}% | Recommendation: ${this.currentTickRangeAnalysis.lpRecommendation} ║`
+        );
+      }
+
+      // Display statistics
+      const tickRangeStats = calculateTickRangeDurationStats(
+        this.tickRangeDurations
+      );
+      console.log(
+        `║ 📊 Tick Changes: ${this.tickHistory.length} | Safe Opportunities: ${this.consecutiveSafeOpportunities} ║`
+      );
+      console.log(
+        `║ ⏱️  Avg Tick Range Duration: ${formatDuration(
+          tickRangeStats.average
+        )} | Volatility: ${(this.calculatePriceVolatility() * 100).toFixed(
+          2
+        )}% ║`
+      );
     }
 
-    console.log('╠══════════════════════════════════════════════════════════════╣');
-    console.log('║ 🎯 LP FARMING TIPS:                                           ║');
-    console.log('║ • Đợi bin ở vị trí SAFE/OPTIMAL trước khi add LP              ║');
-    console.log('║ • Theo dõi edge distances để tối ưu timing                    ║');
-    console.log('║ • Rebalance khi distance đến edge < 15%                       ║');
-    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log(
+      '╠══════════════════════════════════════════════════════════════╣'
+    );
+    console.log(
+      '║ 🎯 LP FARMING TIPS:                                           ║'
+    );
+    console.log(
+      '║ • Wait for tick range in SAFE/OPTIMAL position before adding LP ║'
+    );
+    console.log(
+      '║ • Monitor tick boundary distances to optimize timing          ║'
+    );
+    console.log(
+      '║ • Rebalance when distance to tick boundary < 15%              ║'
+    );
+    console.log(
+      '║ • Higher tick range duration = more stable price              ║'
+    );
+    console.log(
+      '╚══════════════════════════════════════════════════════════════╝'
+    );
     console.log('\n💡 Press Ctrl+C to stop monitoring...\n');
   }
 
@@ -920,27 +924,26 @@ class LPFarmingMonitor {
     if (this.dashboardInterval) {
       clearInterval(this.dashboardInterval);
     }
+    if (this.analysisInterval) {
+      clearInterval(this.analysisInterval);
+    }
+    if (this.aprInterval) {
+      clearInterval(this.aprInterval);
+    }
     console.log('🧹 LP Farming Monitor cleanup completed');
   }
 
   /**
    * Get current high precision price
-   * Returns exact price like "0.00022828235"
    */
   public async getCurrentPrecisePrice(): Promise<string> {
     try {
-      const slot0 = (await this.client.readContract({
-        address: this.poolAddress,
-        abi: poolAbi,
-        functionName: 'slot0',
-      })) as any;
-
-      const sqrtPriceX96 = slot0[0] as bigint;
+      const currentState = await this.poolFetcher.getCurrentPoolState();
       const precisePrice = price1Per0FromSqrtPrecise(
-        sqrtPriceX96,
-        this.token0Decimals!,
-        this.token1Decimals!,
-        18 // 18 decimal precision
+        currentState.sqrtPriceX96,
+        this.token0Decimals,
+        this.token1Decimals,
+        18
       );
 
       return precisePrice;
@@ -960,19 +963,17 @@ async function main() {
   console.log('');
   console.log('╔════════════════════════════════════════════════╗');
   console.log('║          🎯 UNISWAP V3 LP FARMING MONITOR      ║');
-  console.log('║           Multi-Network Smart Edition          ║');
+  console.log('║              Katana Network                   ║');
   console.log('╠════════════════════════════════════════════════╣');
-  console.log('║  📊 Advanced Bin Tracking & Analysis          ║');
+  console.log('║  📊 Advanced Tick Tracking & Analysis         ║');
   console.log('║  💰 APR Calculation & Optimization            ║');
   console.log('║  🎯 LP Opportunity Scoring                     ║');
   console.log('║  📈 Impermanent Loss Monitoring               ║');
   console.log('║  🚨 Real-time Farming Alerts                  ║');
-  console.log('║  🔄 Auto Katana/Mainnet Fallback              ║');
+  console.log('║  🔄 Katana Network Pool Monitoring            ║');
   console.log('╚════════════════════════════════════════════════╝');
   console.log('');
-  console.log(
-    '🌐 Attempting connection: Katana Network → Ethereum Mainnet fallback'
-  );
+  console.log('🌐 Connecting to Katana Network...');
   console.log('');
 
   try {
@@ -983,13 +984,14 @@ async function main() {
     monitor.startMonitoring();
 
     console.log('\n🎯 LP Farming Monitor started successfully!');
-    console.log('📊 Data được ghi vào multiple CSV files:');
-    console.log(`   🔄 Bin Changes: ./data/${config.BIN_CHANGES_CSV}`);
+    console.log('📊 Data is being logged to CSV files:');
+    console.log(`   🔄 Tick Changes: ./data/${config.TICK_CHANGES_CSV}`);
     console.log(
       `   💰 LP Opportunities: ./data/${config.LP_OPPORTUNITIES_CSV}`
     );
     console.log(`   📈 APR Tracking: ./data/${config.APR_TRACKING_CSV}`);
-    console.log('\n🖥️ Real-time dashboard sẽ hiển thị sau 10 giây...');
+    console.log(`   📋 Detailed Data: ./data/${config.DETAILED_POOL_DATA_CSV}`);
+    console.log('\n🖥️ Real-time dashboard will display after 10 seconds...');
 
     // Graceful shutdown handling
     const gracefulShutdown = () => {
@@ -1020,10 +1022,10 @@ async function main() {
     console.error('❌ Failed to start LP Farming Monitor:', error);
     console.error('');
     console.error('🔧 Troubleshooting:');
-    console.error('   1. Check your network connection to Katana/Ronin');
+    console.error('   1. Check your network connection to Katana Network');
     console.error('   2. Verify the pool address is correct');
-    console.error('   3. Ensure you have proper RPC access');
-    console.error('   4. Check if the pool contract exists on Katana');
+    console.error('   3. Ensure you have proper RPC access to Katana');
+    console.error('   4. Check if the pool contract exists on Katana Network');
     console.error('');
     process.exit(1);
   }
