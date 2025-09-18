@@ -51,21 +51,10 @@ export const CONFIG = {
     process.env.TOKEN0_ADDRESS ?? '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36',
   TOKEN1:
     process.env.TOKEN1_ADDRESS ?? '0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62',
-  POSITION_LOWER: process.env.POSITION_LOWER
-    ? Number(process.env.POSITION_LOWER)
-    : undefined,
-  POSITION_UPPER: process.env.POSITION_UPPER
-    ? Number(process.env.POSITION_UPPER)
-    : undefined,
   OUT_SNAPSHOTS: process.env.OUT_SNAPSHOTS || './data/snapshots.csv',
-  OUT_DECISIONS: process.env.OUT_DECISIONS || './data/decisions.csv',
-  OUT_SIGNALS: process.env.OUT_SIGNALS || './data/signals.csv',
   OUT_EVENTS: process.env.OUT_EVENTS || './data/events.csv',
   STATE_FILE: process.env.STATE_FILE || './data/state.json',
   INTERVAL_SEC: Number(process.env.INTERVAL_SEC ?? 0),
   T_HOURS: Number(process.env.T_HOURS ?? 24),
   Z_CONF: Number(process.env.Z_CONF ?? 1.28),
-  SEARCH_WORDS: Number(process.env.SEARCH_WORDS ?? 8),
-  SIM_MODE: (process.env.SIM_MODE ?? '1') !== '0',
-  HUMAN_LOG: (process.env.HUMAN_LOG ?? '1') !== '0',
 } as const;

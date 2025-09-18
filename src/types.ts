@@ -55,15 +55,9 @@ export interface PoolData {
   liquidity: string;
   fee: number;
   spacing: number;
-  obCard: number;
-  leftTick: number | null;
-  rightTick: number | null;
-  initDistLeft: number | undefined;
-  initDistRight: number | undefined;
   twap5mTick: number | undefined;
   twap1hTick: number | undefined;
   sigma: number;
-  oracleQuality: string;
 }
 
 export interface PositionDecision {

@@ -3,12 +3,7 @@
 import { ethers } from 'ethers';
 import { UNISWAP_V3_POOL_ABI, ERC20_ABI, CONFIG } from './constants.js';
 import { PoolData } from './types.js';
-import {
-  priceFromSqrtX96,
-  wordOfTick,
-  bitPosOfTick,
-  isBitSet,
-} from './utils.js';
+import { priceFromSqrtX96 } from './utils.js';
 
 export class PoolService {
   private provider: ethers.providers.JsonRpcProvider;
@@ -61,7 +56,6 @@ export class PoolService {
     const tick: number = slot0[1];
     const sqrtPriceX96 = slot0[0];
     const price = priceFromSqrtX96(sqrtPriceX96, this.dec0, this.dec1);
-    const obCard: number = slot0[3];
 
     // TWAP & sigma calculation
     let twap5mTick: number | undefined;
@@ -81,17 +75,6 @@ export class PoolService {
       // Oracle may not have enough observations
     }
 
-    // Find nearest initialized ticks
-    const { leftTick, rightTick } = await this.findNearestInitializedTicks(
-      tick,
-      spacing,
-      CONFIG.SEARCH_WORDS
-    );
-
-    const initDistLeft = leftTick !== null ? tick - leftTick : undefined;
-    const initDistRight = rightTick !== null ? rightTick - tick : undefined;
-    const oracleQuality = obCard >= 8 ? 'ok' : 'low';
-
     return {
       tick,
       sqrtPriceX96: sqrtPriceX96.toString(),
@@ -99,84 +82,10 @@ export class PoolService {
       liquidity: L_global.toString(),
       fee,
       spacing,
-      obCard,
-      leftTick,
-      rightTick,
-      initDistLeft,
-      initDistRight,
       twap5mTick,
       twap1hTick,
       sigma,
-      oracleQuality,
     };
-  }
-
-  private async findNearestInitializedTicks(
-    activeTick: number,
-    tickSpacing: number,
-    searchWordsEachSide: number
-  ): Promise<{ leftTick: number | null; rightTick: number | null }> {
-    const activeWord = wordOfTick(activeTick, tickSpacing);
-    const activeBit = bitPosOfTick(activeTick, tickSpacing);
-
-    const wordPositions: number[] = [];
-    for (
-      let w = activeWord - searchWordsEachSide;
-      w <= activeWord + searchWordsEachSide;
-      w++
-    ) {
-      wordPositions.push(w);
-    }
-
-    const bitmaps: Record<number, ethers.BigNumber> = {};
-    const res = await Promise.all(
-      wordPositions.map((w) => this.pool.tickBitmap(w))
-    );
-    res.forEach((bm, i) => {
-      bitmaps[wordPositions[i]] = bm as ethers.BigNumber;
-    });
-
-    // Scan right
-    let rightTick: number | null = null;
-    for (
-      let w = activeWord, start = activeBit + 1;
-      w <= activeWord + searchWordsEachSide;
-      w++
-    ) {
-      const bm = bitmaps[w] ?? ethers.BigNumber.from(0);
-      if (!bm.isZero()) {
-        for (let b = start; b <= 255; b++) {
-          if (isBitSet(bm, b)) {
-            rightTick = ((w << 8) | b) * tickSpacing;
-            w = 1e9;
-            break;
-          }
-        }
-      }
-      start = 0;
-    }
-
-    // Scan left
-    let leftTick: number | null = null;
-    for (
-      let w = activeWord, start = activeBit - 1;
-      w >= activeWord - searchWordsEachSide;
-      w--
-    ) {
-      const bm = bitmaps[w] ?? ethers.BigNumber.from(0);
-      if (!bm.isZero()) {
-        for (let b = start; b >= 0; b--) {
-          if (isBitSet(bm, b)) {
-            leftTick = ((w << 8) | b) * tickSpacing;
-            w = -1e9;
-            break;
-          }
-        }
-      }
-      start = 255;
-    }
-
-    return { leftTick, rightTick };
   }
 
   getTokenInfo() {
