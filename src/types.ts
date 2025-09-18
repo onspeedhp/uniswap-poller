@@ -1,80 +1,104 @@
-// types.ts — Type definitions for Uniswap V3 LP Manager
+export interface PoolData {
+  timestamp: number;
+  poolAddress: string;
+  currentPrice: string;
+  liquidity: string;
+  tick: number;
+  feeTier: number;
+  volume24h?: string;
+  fees24h?: string;
+  apr?: number;
+  tickSpacing?: number;
+  feeGrowth0?: number;
+  feeGrowth1?: number;
+  price0to1?: string;
+  price1to0?: string;
+  // Enhanced data from Uniswap SDK
+  sqrtPriceX96?: string;
+  observationIndex?: number;
+  observationCardinality?: number;
+  observationCardinalityNext?: number;
+  feeProtocol?: number;
+  unlocked?: boolean;
+  // Oracle data
+  twap?: string;
+  twal?: string;
+  // Active liquidity data
+  activeLiquidity?: string;
+  liquidityDensity?: LiquidityDensity[];
+}
 
-// Removed unused SimEvent type
+export interface LiquidityDensity {
+  tickIdx: number;
+  liquidityActive: string;
+  liquidityLockedToken0: string;
+  liquidityLockedToken1: string;
+  price0: string;
+  price1: string;
+  isCurrent: boolean;
+}
 
-export interface Position {
-  id: string;
-  lower: number;
-  upper: number;
-  enteredAt: string;
-  entryTick: number;
-  entryPrice: number;
-  amountUsd: number;
-  status: 'active' | 'closed';
-  feesEarned: number;
-  lastRebalanceAt?: string;
-  rebalanceCount: number;
-  // Enhanced fields
-  liquidity: number;
-  token0Amount: number;
-  token1Amount: number;
-  currentValue: number;
+export interface FarmingMetrics {
+  timestamp: number;
+  poolAddress: string;
+  priceRange: {
+    lower: string;
+    upper: string;
+    current: string;
+  };
+  liquidity: string;
+  fees: string;
   impermanentLoss: number;
   totalReturn: number;
-  lastUpdateAt: string;
+  optimalRange?: {
+    lower: string;
+    upper: string;
+    reason: string;
+  };
+  tickLower?: number;
+  tickUpper?: number;
+  positionValue?: number;
+  liquidityUtilization?: number;
+  // Enhanced farming metrics
+  rangeOrderAnalysis?: RangeOrderAnalysis;
+  feeEfficiency?: number;
+  capitalEfficiency?: number;
+  riskScore?: number;
+  recommendedStrategy?: string;
+  // Position analysis
+  positionAnalysis?: PositionAnalysis;
 }
 
-export interface SimState {
-  positions: Position[];
-  totalUsdInvested: number;
-  maxPositions: number;
-  maxUsdPerPosition: number;
-  totalUsdLimit: number;
-  // Enhanced analytics
-  totalFeesEarned: number;
-  totalImpermanentLoss: number;
-  totalReturn: number;
-  winRate: number;
-  averagePositionDuration: number;
-  lastUpdateAt: string;
-  // Enhanced simulation parameters
-  simulationStartTime: string;
-  totalTrades: number;
-  successfulTrades: number;
-  maxDrawdown: number;
-  sharpeRatio: number;
-  // Gas costs
-  totalGasSpent: number;
-  gasCostPerTransaction: number;
+export interface RangeOrderAnalysis {
+  singleSideLiquidity: boolean;
+  optimalTickRange: {
+    lower: number;
+    upper: number;
+  };
+  expectedReturn: number;
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  timeToExecute?: number; // Estimated time for price to cross range
 }
 
-export interface PoolData {
-  tick: number;
-  sqrtPriceX96: string;
-  price: number;
-  liquidity: string;
-  fee: number;
-  spacing: number;
-  twap5mTick: number | undefined;
-  twap1hTick: number | undefined;
-  sigma: number;
+export interface PositionAnalysis {
+  currentPosition: {
+    tickLower: number;
+    tickUpper: number;
+    liquidity: string;
+  };
+  isInRange: boolean;
+  distanceFromCurrent: number; // Ticks away from current price
+  feeAccumulation: string;
+  impermanentLossRisk: number;
+  rebalanceRecommendation?: {
+    newTickLower: number;
+    newTickUpper: number;
+    reason: string;
+  };
 }
 
-export interface PositionDecision {
-  timestamp: string;
-  positionId: string;
-  action: string;
-  reason: string;
-  tick: number;
-  price: string;
-  positionRange: string;
-  distance: number;
-  entryPrice: string;
-  amountUsd: number;
-  currentValue: string;
-  feesEarned: string;
-  impermanentLoss: string;
-  totalReturn: string;
-  timeHeld: string;
-  rebalanceCount: number;
+export interface MonitoringConfig {
+  poolAddress: string;
+  interval: number;
+  logToFile: boolean;
 }

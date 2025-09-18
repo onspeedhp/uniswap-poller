@@ -1,16 +1,19 @@
 {
-  "name": "uniswap-v3-lp-decider",
-  "version": "0.1.0",
-  "private": true,
+  "name": "katana-vbusdc-vbeth-farming-monitor",
+  "version": "1.0.0",
+  "description": "Monitor vbUSDC/vbETH pool on Katana for liquidity farming",
   "type": "module",
   "scripts": {
-    "dev": "HUMAN_LOG=1 INTERVAL_SEC=30 tsx src/main.ts",
+    "start": "tsx src/main.ts",
     "build": "tsc",
-    "start": "node dist/main.js"
+    "dev": "tsx src/main.ts"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "ethers": "^5.7.2"
+    "@uniswap/sdk-core": "3.2.3",
+    "@uniswap/v3-sdk": "^3.9.0",
+    "@uniswap/v3-core": "^1.0.1",
+    "ethers": "^5.7.2",
+    "dotenv": "^16.4.5"
   },
   "devDependencies": {
     "@types/node": "^24.5.1",

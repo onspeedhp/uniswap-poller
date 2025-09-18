@@ -44,3 +44,4 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+docs
